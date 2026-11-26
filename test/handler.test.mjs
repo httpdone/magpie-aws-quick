@@ -1370,3 +1370,138 @@ test('session-key fallback does not splice one subagent\'s tool results into a s
   const [tB, tA2] = [fake.state.userMessages[before - 1], fake.state.userMessages[before]]
   assert.notEqual(tA2.threadId, tB.threadId, 'must not resume the sibling thread')
 })
+
+// ---------- tool-calling reliability: spec re-anchor + argument corrections ----------
+
+const textOnlyScript = () => [
+  { type: 'text_delta', payload: { delta: 'sure, done' } },
+  { type: 'message_complete', payload: { text: 'sure, done' } },
+]
+
+test('reused thread re-anchors the full tool spec after toolSpecReanchorTurns reminder turns', async () => {
+  const f = await startFakeQuick({ script: textOnlyScript })
+  const sessions = createSessionStore()
+  const tools = [fnTool('Read')]
+  const opts = { identity: 'reanchor-acct', log: () => {}, toolSpecReanchorTurns: 2 }
+  try {
+    const u1 = { role: 'user', content: 'one' }
+    const r1 = await handleChatCompletions({ body: { model: 'fast', messages: [u1], tools }, outpostMgr: fakeMgr(f), sessions, options: opts })
+    const a1 = (await r1.json()).choices[0].message.content
+    assert.match(f.state.userMessages.at(-1).payload.text, /\[Client tool calling\][\s\S]*file_path/, 'fresh thread carries the full spec')
+
+    const convo2 = [u1, { role: 'assistant', content: a1 }, { role: 'user', content: 'two' }]
+    const r2 = await handleChatCompletions({ body: { model: 'fast', messages: convo2, tools }, outpostMgr: fakeMgr(f), sessions, options: opts })
+    const a2 = (await r2.json()).choices[0].message.content
+    const t2 = f.state.userMessages.at(-1)
+    assert.match(t2.payload.text, /Client tool calling — reminder/, 'first reuse sends only the reminder')
+    assert.ok(!t2.payload.text.includes('"file_path"'), 'no schema in the reminder turn')
+
+    const convo3 = [...convo2, { role: 'assistant', content: a2 }, { role: 'user', content: 'three' }]
+    await (await handleChatCompletions({ body: { model: 'fast', messages: convo3, tools }, outpostMgr: fakeMgr(f), sessions, options: opts })).json()
+    const t3 = f.state.userMessages.at(-1)
+    assert.equal(t3.threadId, t2.threadId, 'still the same thread')
+    assert.match(t3.payload.text, /\[Client tool calling\][\s\S]*file_path/, 'second reminder turn re-anchors the full spec')
+    assert.ok(!t3.payload.text.includes('— reminder'), 're-anchor replaces the reminder')
+  } finally {
+    await f.close()
+  }
+})
+
+test('toolSpecReanchorTurns: 0 disables the periodic re-anchor', async () => {
+  const f = await startFakeQuick({ script: textOnlyScript })
+  const sessions = createSessionStore()
+  const tools = [fnTool('Read')]
+  const opts = { identity: 'reanchor-off-acct', log: () => {}, toolSpecReanchorTurns: 0 }
+  try {
+    const u1 = { role: 'user', content: 'one' }
+    const r1 = await handleChatCompletions({ body: { model: 'fast', messages: [u1], tools }, outpostMgr: fakeMgr(f), sessions, options: opts })
+    let a = (await r1.json()).choices[0].message.content
+    let convo = [u1, { role: 'assistant', content: a }]
+    for (let i = 0; i < 4; i++) {
+      convo = [...convo, { role: 'user', content: `turn ${i}` }]
+      const r = await handleChatCompletions({ body: { model: 'fast', messages: convo, tools }, outpostMgr: fakeMgr(f), sessions, options: opts })
+      a = (await r.json()).choices[0].message.content
+      convo = [...convo, { role: 'assistant', content: a }]
+    }
+    const last = f.state.userMessages.at(-1)
+    assert.match(last.payload.text, /— reminder/, 'reminder keeps riding')
+    assert.ok(!last.payload.text.includes('"file_path"'), 'never re-anchored')
+  } finally {
+    await f.close()
+  }
+})
+
+test('a plain-text answer to tool results forces a re-anchor on the next turn', async () => {
+  const f = await startFakeQuick({ script: textOnlyScript })
+  const sessions = createSessionStore()
+  const tools = [fnTool('Read')]
+  const opts = { identity: 'reactive-acct', log: () => {}, toolSpecReanchorTurns: 99 }
+  try {
+    const u1 = { role: 'user', content: 'read config' }
+    const r1 = await handleChatCompletions({ body: { model: 'fast', messages: [u1], tools }, outpostMgr: fakeMgr(f), sessions, options: opts })
+    const a1 = (await r1.json()).choices[0].message.content
+
+    // the client reports a tool result, and the model answers in plain text
+    // (the drift failure) — the counter alone (99) would never re-anchor
+    const convo2 = [
+      u1, { role: 'assistant', content: a1 },
+      { role: 'user', content: 'again' },
+    ]
+    const r2 = await handleChatCompletions({ body: { model: 'fast', messages: convo2, tools }, outpostMgr: fakeMgr(f), sessions, options: opts })
+    const a2 = (await r2.json()).choices[0].message.content
+    // craft the history so the next turn's delta carries a tool result —
+    // the client executed a call, and the fake answers it in plain text
+    const convo3b = [
+      u1, { role: 'assistant', content: a1, tool_calls: [{ id: 'c0', type: 'function', function: { name: 'Read', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c0', content: 'data' },
+      { role: 'user', content: 'and?' },
+    ]
+    await (await handleChatCompletions({ body: { model: 'fast', messages: convo3b, tools }, outpostMgr: fakeMgr(f), sessions, options: opts })).json()
+    const t3 = f.state.userMessages.at(-1)
+    assert.match(t3.payload.text, /\[Client tool calling\][\s\S]*file_path/, 'drift forces a re-anchor despite the high counter')
+  } finally {
+    await f.close()
+  }
+})
+
+test('schema-violating arguments ride the next reused turn as corrections', async () => {
+  const f = await startFakeQuick({
+    script: (userPayload) => {
+      // first turn: the model writes with a numeric file_path (schema violation);
+      // later turns: plain text
+      if (userPayload.text?.includes('write it')) {
+        return [
+          { type: 'text_delta', payload: { delta: '<tool_call>{"name":"Write","arguments":{"file_path":42}}</tool_call>' } },
+          { type: 'message_complete', payload: { text: 'x' } },
+        ]
+      }
+      return textOnlyScript()
+    },
+  })
+  const sessions = createSessionStore()
+  const tools = [{
+    type: 'function',
+    function: { name: 'Write', description: 'write', parameters: { type: 'object', required: ['file_path', 'content'], properties: { file_path: { type: 'string' }, content: { type: 'string' } } } },
+  }]
+  const opts = { identity: 'argfix-acct', log: () => {} }
+  try {
+    const u1 = { role: 'user', content: 'write it' }
+    const r1 = await handleChatCompletions({ body: { model: 'fast', messages: [u1], tools }, outpostMgr: fakeMgr(f), sessions, options: opts })
+    const j1 = await r1.json()
+    const call = j1.choices[0].message.tool_calls?.[0]
+    assert.ok(call, 'the malformed call is still passed through (client decides)')
+
+    const convo2 = [
+      u1,
+      { role: 'assistant', content: '', tool_calls: [call] },
+      { role: 'tool', tool_call_id: call.id, content: 'Error: file_path must be a string' },
+    ]
+    await (await handleChatCompletions({ body: { model: 'fast', messages: convo2, tools }, outpostMgr: fakeMgr(f), sessions, options: opts })).json()
+    const t2 = f.state.userMessages.at(-1)
+    assert.match(t2.payload.text, /Corrections — your previous tool call/, 'correction note rides the next turn')
+    assert.match(t2.payload.text, /missing required "content"/)
+    assert.match(t2.payload.text, /"file_path" should be string, got number/)
+  } finally {
+    await f.close()
+  }
+})
