@@ -324,3 +324,36 @@ test('renderDelta: clean deltas never get the foreign treatment', () => {
   const out = renderDelta([{ role: 'user', content: 'plain question' }])
   assert.equal(out, 'plain question')
 })
+
+test('renderDelta lets large single or parallel tool results use the available finite maxBytes budget', () => {
+  // Single 40KB file in a 55KB budget stays completely untruncated (no premature 16KB cap).
+  const single = [{ role: 'tool', tool_call_id: 'c1', name: 'Read', content: 'A'.repeat(40 * 1024) }]
+  const s1 = {}
+  const out1 = renderDelta(single, { maxBytes: 55 * 1024, stats: s1 })
+  assert.equal(s1.truncated, undefined)
+  assert.ok(out1.includes('A'.repeat(40 * 1024)))
+
+  // Two parallel 24KB files in a 55KB budget both survive untruncated.
+  const pair = [
+    { role: 'tool', tool_call_id: 'c1', name: 'Read', content: 'X'.repeat(24 * 1024) },
+    { role: 'tool', tool_call_id: 'c2', name: 'Read', content: 'Y'.repeat(24 * 1024) },
+  ]
+  const s2 = {}
+  const out2 = renderDelta(pair, { maxBytes: 55 * 1024, stats: s2 })
+  assert.equal(s2.truncated, undefined)
+  assert.ok(out2.includes('X'.repeat(24 * 1024)))
+  assert.ok(out2.includes('Y'.repeat(24 * 1024)))
+
+  // 40KB tool result + 20KB user question in a 30KB budget: user stays intact, tool gets ~10KB.
+  const q = 'Q'.repeat(20 * 1024)
+  const mixed = [
+    { role: 'tool', tool_call_id: 'c1', name: 'Read', content: 'HEAD' + 'T'.repeat(40 * 1024) + 'TAIL' },
+    { role: 'user', content: q },
+  ]
+  const s3 = {}
+  const out3 = renderDelta(mixed, { maxBytes: 30 * 1024, stats: s3 })
+  assert.equal(s3.truncated, true)
+  assert.ok(byteLen(out3) <= 30 * 1024)
+  assert.ok(out3.endsWith(q), 'user question must stay untruncated')
+  assert.ok(out3.includes('HEAD') && out3.includes('TAIL'), 'tool result keeps head + tail in remaining room')
+})
