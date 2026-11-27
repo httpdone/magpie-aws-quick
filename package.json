@@ -1,6 +1,6 @@
 {
   "name": "magpie-aws-quick",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "magpie / OpenCode provider plugin: use your own Amazon Quick (AWS Quick) account as a provider",
   "type": "module",
   "main": "./index.mjs",
@@ -43,7 +43,7 @@
     "icon": "https://aws.amazon.com/favicon.ico",
     "summary": {
       "en": "Your own Amazon Quick account as a provider.",
-      "zh": "用你自己的 Amazon Quick 账号作为模型提供方。"
+      "zh": "\u7528\u4f60\u81ea\u5df1\u7684 Amazon Quick \u8d26\u53f7\u4f5c\u4e3a\u6a21\u578b\u63d0\u4f9b\u65b9\u3002"
     }
   }
 }
