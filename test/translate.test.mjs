@@ -357,3 +357,31 @@ test('renderDelta lets large single or parallel tool results use the available f
   assert.ok(out3.endsWith(q), 'user question must stay untruncated')
   assert.ok(out3.includes('HEAD') && out3.includes('TAIL'), 'tool result keeps head + tail in remaining room')
 })
+
+test('renderTranscript and renderDelta map tool names without mutating input messages', () => {
+  const mapToolName = (n) => (n === 'web_search' ? 'client_web_search' : n)
+  const msgs = [
+    { role: 'user', content: 'search' },
+    { role: 'assistant', content: [{ type: 'tool_use', name: 'web_search', input: { q: 'test' } }], tool_calls: [{ id: 'c1', type: 'function', function: { name: 'web_search', arguments: '{"q":"test"}' } }] },
+    { role: 'tool', tool_call_id: 'c1', name: 'web_search', content: 'result body' },
+    { role: 'user', content: 'follow up' },
+  ]
+  const transcript = renderTranscript(msgs, '')
+  assert.ok(transcript.includes('[called tool web_search('))
+  const mappedTranscript = renderTranscript(msgs, '', { mapToolName })
+  assert.ok(mappedTranscript.includes('[called tool client_web_search({"q":"test"})]'))
+  assert.ok(mappedTranscript.includes('[tool_result client_web_search c1]'))
+  assert.ok(!mappedTranscript.includes('[tool_result web_search c1]'))
+
+  const delta = [
+    { role: 'assistant', content: '', tool_calls: [{ id: 'c2', type: 'function', function: { name: 'web_search', arguments: '{"q":"x"}' } }] },
+    { role: 'tool', tool_call_id: 'c2', name: 'web_search', content: 'ok' },
+    { role: 'user', content: 'next' },
+  ]
+  const mappedDelta = renderDelta(delta, { mapToolName })
+  assert.ok(mappedDelta.includes('[called tool client_web_search({"q":"x"})]'))
+  assert.ok(mappedDelta.includes('[tool_result client_web_search c2]'))
+  assert.equal(msgs[1].tool_calls[0].function.name, 'web_search')
+  assert.equal(msgs[2].name, 'web_search')
+  assert.equal(delta[1].name, 'web_search')
+})

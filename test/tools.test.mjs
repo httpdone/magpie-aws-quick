@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { normalizeTools, buildToolPreamble, createToolCallParser, slimSchema, createSourcesStripper } from '../lib/tools.mjs'
+import { normalizeTools, aliasClientTools, aliasToolChoice, buildToolPreamble, createToolCallParser, slimSchema, createSourcesStripper } from '../lib/tools.mjs'
 import { byteLen } from '../lib/translate.mjs'
 
 test('normalizeTools keeps only named function tools', () => {
@@ -274,5 +274,48 @@ test('parser ignores literal </tool_call> inside JSON string arguments across ar
     assert.equal(calls[0].name, 'Write')
     assert.equal(calls[0].arguments.content, 'const CLOSE = "</tool_call>";\n// </tool_call>')
   }
+})
+
+test('aliasClientTools renames colliding web_search variants and avoids name collisions', () => {
+  const tools = normalizeTools([
+    { type: 'function', function: { name: 'web_search', description: 'ws' } },
+    { type: 'function', function: { name: 'WebSearch', description: 'cc' } },
+    { type: 'function', function: { name: 'brave_web_search', description: 'bws' } },
+    { type: 'function', function: { name: 'fetch_content', description: 'fc' } },
+  ])
+  const { tools: mapped, toUpstream, toClient } = aliasClientTools(tools)
+  assert.deepEqual(mapped.map((t) => t.name), ['client_web_search', 'client_WebSearch', 'brave_web_search', 'fetch_content'])
+  assert.equal(toUpstream.get('web_search'), 'client_web_search')
+  assert.equal(toUpstream.get('WebSearch'), 'client_WebSearch')
+  assert.equal(toUpstream.has('brave_web_search'), false)
+  assert.equal(toClient.get('client_web_search'), 'web_search')
+  assert.equal(toClient.get('client_WebSearch'), 'WebSearch')
+
+  // Collision avoidance if client_web_search is already declared
+  const colliding = normalizeTools([
+    { type: 'function', function: { name: 'web_search' } },
+    { type: 'function', function: { name: 'client_web_search' } },
+  ])
+  const res2 = aliasClientTools(colliding)
+  assert.deepEqual(res2.tools.map((t) => t.name), ['client_web_search_2', 'client_web_search'])
+  assert.equal(res2.toClient.get('client_web_search_2'), 'web_search')
+})
+
+test('aliasToolChoice rewrites named OpenAI and Anthropic tool choices', () => {
+  const toUpstream = new Map([['web_search', 'client_web_search']])
+  assert.equal(aliasToolChoice('auto', toUpstream), 'auto')
+  assert.equal(aliasToolChoice('required', toUpstream), 'required')
+  assert.deepEqual(
+    aliasToolChoice({ type: 'function', function: { name: 'web_search' } }, toUpstream),
+    { type: 'function', function: { name: 'client_web_search' } },
+  )
+  assert.deepEqual(
+    aliasToolChoice({ type: 'tool', name: 'web_search' }, toUpstream),
+    { type: 'tool', name: 'client_web_search' },
+  )
+  assert.deepEqual(
+    aliasToolChoice({ type: 'function', function: { name: 'fetch_content' } }, toUpstream),
+    { type: 'function', function: { name: 'fetch_content' } },
+  )
 })
 
