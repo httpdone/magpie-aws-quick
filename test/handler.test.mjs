@@ -1579,3 +1579,75 @@ test('schema-violating arguments ride the next reused turn as corrections', asyn
     await f.close()
   }
 })
+
+// ---------- advanced plan-gating fallback (#23) ----------
+
+test('advanced gated by plan transparently retries as smart, then downgrades from the start', async () => {
+  const f = await startFakeQuick({
+    script: (userPayload) => {
+      if (userPayload.agent_mode === 'advanced') {
+        return [{ type: 'error', payload: { message: 'Something went wrong — please try again.' } }]
+      }
+      return [
+        { type: 'text_delta', payload: { delta: 'smart answer' } },
+        { type: 'message_complete', payload: { text: 'smart answer' } },
+      ]
+    },
+  })
+  try {
+    const opts = { identity: 'gated-acct', log: () => {} }
+    const r1 = await handleChatCompletions({
+      body: { model: 'advanced', messages: [{ role: 'user', content: 'hi' }], stream: false },
+      outpostMgr: fakeMgr(f), sessions: createSessionStore(), options: opts,
+    })
+    assert.equal(r1.status, 200, 'transparent smart retry succeeds')
+    assert.equal((await r1.json()).choices[0].message.content, 'smart answer')
+    const modes = f.state.userMessages.map((m) => m.payload.agent_mode)
+    assert.ok(modes.includes('advanced') && modes.includes('smart'), 'both modes attempted on first request')
+
+    const before = f.state.userMessages.length
+    const r2 = await handleChatCompletions({
+      body: { model: 'advanced', messages: [{ role: 'user', content: 'again' }], stream: false },
+      outpostMgr: fakeMgr(f), sessions: createSessionStore(), options: opts,
+    })
+    assert.equal(r2.status, 200)
+    const modes2 = f.state.userMessages.slice(before).map((m) => m.payload.agent_mode)
+    assert.ok(modes2.length && modes2.every((m) => m === 'smart'), 'cached downgrade skips the doomed advanced attempt')
+  } finally {
+    await f.close()
+  }
+})
+
+test('advanced failure is not cached when smart also fails', async () => {
+  const f = await startFakeQuick({
+    script: () => [{ type: 'error', payload: { message: 'Something went wrong — please try again.' } }],
+  })
+  try {
+    const opts = { identity: 'all-fail-acct', log: () => {} }
+    const r1 = await handleChatCompletions({
+      body: { model: 'advanced', messages: [{ role: 'user', content: 'hi' }], stream: false },
+      outpostMgr: fakeMgr(f), sessions: createSessionStore(), options: opts,
+    })
+    assert.equal(r1.status, 502, 'original error surfaces when smart fails too')
+    const modes = f.state.userMessages.map((m) => m.payload.agent_mode)
+    assert.ok(modes.includes('smart'), 'smart retry was attempted')
+  } finally {
+    await f.close()
+  }
+})
+
+test('non-advanced 502s are not retried', async () => {
+  const f = await startFakeQuick({
+    script: () => [{ type: 'error', payload: { message: 'Something went wrong — please try again.' } }],
+  })
+  try {
+    const r1 = await handleChatCompletions({
+      body: { model: 'smart', messages: [{ role: 'user', content: 'hi' }], stream: false },
+      outpostMgr: fakeMgr(f), sessions: createSessionStore(), options: { identity: 'plain-502-acct', log: () => {} },
+    })
+    assert.equal(r1.status, 502)
+    assert.equal(f.state.userMessages.length, 1, 'exactly one upstream attempt')
+  } finally {
+    await f.close()
+  }
+})
