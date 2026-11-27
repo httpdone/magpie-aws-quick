@@ -64,20 +64,48 @@ test('preamble compacts schema annotations and caps giant schemas', () => {
   assert.ok(!p.includes('field_1'))
 })
 
-test('preamble falls back to name+description when toolset is enormous', () => {
-  const tools = normalizeTools(Array.from({ length: 60 }, (_, i) => ({
+test('preamble degrades from full JSON schema to compact typed signatures, then lite', () => {
+  // 60 tools with 15 params exceed PREAMBLE_CAP (40KB) in full JSON schema,
+  // so buildToolPreamble falls back to compact signatures (preserving param names/types).
+  const medium = normalizeTools(Array.from({ length: 60 }, (_, i) => ({
     type: 'function',
     function: {
       name: `tool_${i}`,
       description: `description ${i} `.repeat(30),
-      parameters: { type: 'object', properties: Object.fromEntries(Array.from({ length: 15 }, (_, j) => [`p${j}`, { type: 'string', description: 'x'.repeat(60) }])) },
+      parameters: {
+        type: 'object',
+        required: ['p0'],
+        properties: Object.fromEntries(Array.from({ length: 15 }, (_, j) => [`p${j}`, { type: 'string', description: 'x'.repeat(60) }])),
+      },
     },
   })))
-  const p = buildToolPreamble(tools, 'auto')
-  assert.ok(byteLen(p) < 45 * 1024)
-  assert.ok(p.includes('parameter schemas omitted'))
-  assert.ok(p.includes('- tool_0:'))
-  assert.ok(!p.includes('"properties"'))
+  const statsCompact = {}
+  const pCompact = buildToolPreamble(medium, 'auto', { stats: statsCompact })
+  assert.ok(byteLen(pCompact) < 40 * 1024)
+  assert.ok(pCompact.includes('compact signatures'))
+  assert.ok(pCompact.includes('- tool_0(p0!: string, p1?: string'))
+  assert.ok(!pCompact.includes('"properties"'))
+  assert.equal(statsCompact.truncated, true)
+
+  // Truly enormous toolset where even compact signatures exceed PREAMBLE_CAP
+  // falls back all the way to lite (name + description).
+  const huge = normalizeTools(Array.from({ length: 120 }, (_, i) => ({
+    type: 'function',
+    function: {
+      name: `tool_${i}`,
+      description: `description ${i} `.repeat(20),
+      parameters: {
+        type: 'object',
+        properties: Object.fromEntries(Array.from({ length: 20 }, (_, j) => [`param_${j}`, { type: 'string' }])),
+      },
+    },
+  })))
+  const statsLite = {}
+  const pLite = buildToolPreamble(huge, 'auto', { stats: statsLite })
+  assert.ok(byteLen(pLite) < 40 * 1024)
+  assert.ok(pLite.includes('parameter schemas omitted'))
+  assert.ok(pLite.includes('- tool_0:'))
+  assert.equal(statsLite.truncated, true)
 })
 
 test('parser extracts blocks split across deltas', () => {
@@ -224,5 +252,27 @@ test('end() salvages a complete JSON block split across deltas at EOS', () => {
   assert.equal(end.calls.length, 1)
   assert.equal(end.calls[0].name, 'Read')
   assert.equal(end.calls[0].arguments.file_path, 'a.txt')
+})
+
+test('parser ignores literal </tool_call> inside JSON string arguments across arbitrary splits', () => {
+  const stream = 'ok <tool_call>{"name":"Write","arguments":{"file_path":"tools.mjs","content":"const CLOSE = \\"</tool_call>\\";\\n// </tool_call>"}}</tool_call> done'
+  for (const step of [stream.length, 7, 1]) {
+    const p = createToolCallParser()
+    let text = ''
+    const calls = []
+    for (let i = 0; i < stream.length; i += step) {
+      const r = p.push(stream.slice(i, i + step))
+      text += r.text
+      calls.push(...r.calls)
+    }
+    const end = p.end()
+    text += end.text
+    calls.push(...end.calls)
+    assert.equal(end.dropped, undefined, `step=${step} must not drop`)
+    assert.equal(text, 'ok  done', `step=${step} visible text`)
+    assert.equal(calls.length, 1, `step=${step} single call`)
+    assert.equal(calls[0].name, 'Write')
+    assert.equal(calls[0].arguments.content, 'const CLOSE = "</tool_call>";\n// </tool_call>')
+  }
 })
 

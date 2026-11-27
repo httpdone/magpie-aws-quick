@@ -1370,3 +1370,78 @@ test('session-key fallback does not splice one subagent\'s tool results into a s
   const [tB, tA2] = [fake.state.userMessages[before - 1], fake.state.userMessages[before]]
   assert.notEqual(tA2.threadId, tB.threadId, 'must not resume the sibling thread')
 })
+
+test('large toolset degrades to compact typed signatures and surfaces truncation note on internal PREAMBLE_CAP downgrade', async () => {
+  // 55 tools × 18 props exceed PREAMBLE_CAP (40KB) in full JSON schema (~55KB),
+  // while compact signatures stay ~19KB (< textCap - 8KB). The stream must still
+  // emit the 64KB truncation note and preserve parameter names/types.
+  const tools = Array.from({ length: 55 }, (_, i) => ({
+    type: 'function',
+    function: {
+      name: `verbose_tool_${i}`,
+      description: `does work ${i}`,
+      parameters: {
+        type: 'object',
+        required: ['param_0'],
+        properties: Object.fromEntries(Array.from({ length: 18 }, (_, j) => [`param_${j}`, { type: 'string', minLength: 1, maxLength: 100 }])),
+      },
+    },
+  }))
+  const res = await req({
+    model: 'fast',
+    stream: true,
+    messages: [{ role: 'user', content: 'pick a tool' }],
+    tools,
+  })
+  assert.equal(res.status, 200)
+  const sse = await res.text()
+  const sent = fake.state.userMessages.at(-1).payload.text
+  assert.ok(sent.includes('compact signatures'), 'degrades to compact typed signatures')
+  assert.ok(sent.includes('verbose_tool_0(param_0!: string, param_1?: string'), 'preserves param names and types')
+  assert.match(sse, /64KB/, 'surfaces truncation note when internal PREAMBLE_CAP downgrade occurs')
+})
+
+test('reused thread delivers 36KB single and 2x22KB parallel tool results untruncated when frame has room', async () => {
+  const sessions = createSessionStore()
+  const tools = [fnTool('Read')]
+  const r1 = await req({
+    model: 'fast',
+    tools,
+    messages: [{ role: 'user', content: 'read files' }],
+  }, { sessions })
+  const a1 = (await r1.json()).choices[0].message.content
+
+  const big = 'F'.repeat(36 * 1024)
+  const r2 = await req({
+    model: 'fast',
+    tools,
+    messages: [
+      { role: 'user', content: 'read files' },
+      { role: 'assistant', content: a1 },
+      { role: 'tool', tool_call_id: 'c1', name: 'Read', content: big },
+    ],
+  }, { sessions })
+  const a2 = (await r2.json()).choices[0].message.content
+  const p2 = fake.state.userMessages.at(-1).payload
+  assert.ok(p2.text.includes(big), '36KB tool_result must not be truncated at 16KB')
+  assert.ok(frameBytes(p2.thread_id, p2) <= UPSTREAM_TEXT_LIMIT)
+
+  const fileA = 'M'.repeat(22 * 1024)
+  const fileB = 'N'.repeat(22 * 1024)
+  await req({
+    model: 'fast',
+    tools,
+    messages: [
+      { role: 'user', content: 'read files' },
+      { role: 'assistant', content: a1 },
+      { role: 'tool', tool_call_id: 'c1', name: 'Read', content: big },
+      { role: 'assistant', content: a2 },
+      { role: 'tool', tool_call_id: 'c2', name: 'Read', content: fileA },
+      { role: 'tool', tool_call_id: 'c3', name: 'Read', content: fileB },
+    ],
+  }, { sessions })
+  const p3 = fake.state.userMessages.at(-1).payload
+  assert.ok(p3.text.includes(fileA), 'first 22KB parallel tool_result must fit untruncated')
+  assert.ok(p3.text.includes(fileB), 'second 22KB parallel tool_result must fit untruncated')
+  assert.ok(frameBytes(p3.thread_id, p3) <= UPSTREAM_TEXT_LIMIT)
+})
