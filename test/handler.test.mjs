@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { startFakeQuick, defaultScript } from './helpers/fake-quick.mjs'
-import { PLAIN_TEXT_NOTE, TOOLS_STILL_APPLY, INVALID_CALL_TOOL, handleChatCompletions, handleModels } from '../lib/handler.mjs'
+import { PLAIN_TEXT_NOTE, TOOLS_STILL_APPLY, INVALID_CALL_TOOL, clientWebSearchNote, handleChatCompletions, handleModels } from '../lib/handler.mjs'
 import { createSessionStore } from '../lib/sessions.mjs'
 import { byteLen, frameBytes, UPSTREAM_TEXT_LIMIT } from '../lib/translate.mjs'
 import { OutpostError } from '../lib/outpost.mjs'
@@ -1647,6 +1647,156 @@ test('non-advanced 502s are not retried', async () => {
     })
     assert.equal(r1.status, 502)
     assert.equal(f.state.userMessages.length, 1, 'exactly one upstream attempt')
+  } finally {
+    await f.close()
+  }
+})
+
+// ---------- client web_search disambiguation ----------
+
+test('client web_search is aliased upstream, bridged in custom_prompt, restored on output, and reuses thread', async () => {
+  let turn = 0
+  const f = await startFakeQuick({
+    script: () => {
+      turn++
+      if (turn === 1) {
+        const call = '<tool_call>{"name":"client_web_search","arguments":{"query":"node 24"}}</tool_call>'
+        return [{ type: 'text_delta', payload: { delta: call } }, { type: 'message_complete', payload: { text: call } }]
+      }
+      return [{ type: 'text_delta', payload: { delta: 'done' } }, { type: 'message_complete', payload: { text: 'done' } }]
+    },
+  })
+  try {
+    const sessions = createSessionStore()
+    const opts = { identity: 'websearch-alias-acct', log: () => {} }
+    const tools = [
+      { type: 'function', function: { name: 'web_search', parameters: { type: 'object', required: ['query'], properties: { query: { type: 'string' } } } } },
+      { type: 'function', function: { name: 'fetch_content', parameters: { type: 'object', properties: {} } } },
+    ]
+    const r1 = await handleChatCompletions({
+      body: {
+        model: 'smart',
+        tools,
+        tool_choice: { type: 'function', function: { name: 'web_search' } },
+        messages: [{ role: 'user', content: 'search latest release' }],
+      },
+      outpostMgr: fakeMgr(f), sessions, options: opts,
+    })
+    assert.equal(r1.status, 200)
+    const msg1 = (await r1.json()).choices[0].message
+    assert.equal(msg1.tool_calls.length, 1)
+    assert.equal(msg1.tool_calls[0].function.name, 'web_search', 'restores client tool name in response')
+
+    const p1 = f.state.userMessages.at(-1).payload
+    assert.equal(p1.web_search_enabled, false)
+    assert.ok(p1.text.includes('- client_web_search:'), 'preamble declares client_web_search')
+    assert.ok(!p1.text.includes('- web_search:'), 'colliding web_search absent from preamble')
+    assert.ok(p1.text.includes('requires the client tool "client_web_search"'), 'forced tool_choice mapped upstream')
+    assert.ok(p1.custom_prompt.includes(clientWebSearchNote([{ name: 'web_search' }])))
+    assert.match(p1.custom_prompt, /`web_search`.*`client_web_search`/)
+
+    // Reused thread receives echoed web_search call + tool_result, maps tool_result head upstream, and keeps thread_id
+    const r2 = await handleChatCompletions({
+      body: {
+        model: 'smart',
+        tools,
+        messages: [
+          { role: 'user', content: 'search latest release' },
+          msg1,
+          { role: 'tool', tool_call_id: msg1.tool_calls[0].id, name: 'web_search', content: 'Node 24 released' },
+        ],
+      },
+      outpostMgr: fakeMgr(f), sessions, options: opts,
+    })
+    assert.equal(r2.status, 200)
+    await r2.json()
+    const p2 = f.state.userMessages.at(-1).payload
+    assert.equal(p2.thread_id, p1.thread_id, 'second turn reuses thread')
+    assert.ok(p2.text.includes('client_web_search'), 'reminder and tool_result use upstream alias')
+    assert.ok(p2.text.includes(`[tool_result client_web_search ${msg1.tool_calls[0].id}]`))
+    assert.ok(p2.custom_prompt.includes('`client_web_search`'), 'alias bridge rides on reused turns via custom_prompt')
+    assert.ok(!p2.text.includes('Web search note:'), 'clarification stays out of thread text history')
+  } finally {
+    await f.close()
+  }
+})
+
+test('web_search alias restores across EOS salvage and native Quick tool_arguments salvage', async () => {
+  let turn = 0
+  const f = await startFakeQuick({
+    script: () => {
+      turn++
+      if (turn === 1) {
+        // Unterminated close tag at EOS -> salvaged via parser.end().calls
+        return [
+          { type: 'text_delta', payload: { delta: '<tool_call>{"name":"client_web_search","arguments":{"query":"eos"}}' } },
+          { type: 'message_complete', payload: { text: '' } },
+        ]
+      }
+      // Native Quick tool_start/tool_arguments targeting the alias
+      return [
+        { type: 'tool_start', payload: { tool_id: 'ws1', tool_name: 'client_web_search' } },
+        { type: 'tool_arguments', payload: { tool_id: 'ws1', tool_name: 'client_web_search', arguments: { query: 'native' } } },
+        { type: 'turn_usage', payload: { input_tokens: 10, output_tokens: 5 } },
+      ]
+    },
+  })
+  try {
+    const opts = { identity: 'websearch-salvage-acct', log: () => {} }
+    const tools = [{ type: 'function', function: { name: 'web_search', parameters: { type: 'object', properties: { query: { type: 'string' } } } } }]
+
+    const r1 = await handleChatCompletions({
+      body: { model: 'smart', tools, messages: [{ role: 'user', content: 'q1' }] },
+      outpostMgr: fakeMgr(f), options: opts,
+    })
+    assert.equal(r1.status, 200)
+    const j1 = await r1.json()
+    assert.equal(j1.choices[0].message.tool_calls[0].function.name, 'web_search')
+    assert.equal(JSON.parse(j1.choices[0].message.tool_calls[0].function.arguments).query, 'eos')
+
+    const r2 = await handleChatCompletions({
+      body: { model: 'smart', tools, messages: [{ role: 'user', content: 'q2' }] },
+      outpostMgr: fakeMgr(f), options: opts,
+    })
+    assert.equal(r2.status, 200)
+    const j2 = await r2.json()
+    assert.equal(j2.choices[0].message.tool_calls[0].function.name, 'web_search')
+    assert.equal(JSON.parse(j2.choices[0].message.tool_calls[0].function.arguments).query, 'native')
+  } finally {
+    await f.close()
+  }
+})
+
+test('clientWebSearchNote handles WebSearch, non-colliding search tools, unrelated tools, and tool_choice none', async () => {
+  assert.equal(clientWebSearchNote([{ name: 'Write' }, { name: 'fetch_content' }, { name: 'get_search_content' }]), '')
+  const multi = clientWebSearchNote([{ name: 'WebSearch' }, { name: 'brave_web_search' }, { name: 'WebSearch' }])
+  assert.match(multi, /`WebSearch`.*`client_WebSearch`/)
+  assert.match(multi, /`brave_web_search`.*also enabled/)
+  const onlyOther = clientWebSearchNote([{ name: 'brave_web_search' }])
+  assert.match(onlyOther, /The client tool `brave_web_search` is enabled and available/)
+
+  const f = await startFakeQuick({})
+  try {
+    const opts = { identity: 'no-websearch-note-acct', log: () => {} }
+    const nonSearchTools = [{ type: 'function', function: { name: 'fetch_content', parameters: { type: 'object', properties: {} } } }]
+    const r1 = await handleChatCompletions({
+      body: { model: 'smart', tools: nonSearchTools, messages: [{ role: 'user', content: 'hi' }] },
+      outpostMgr: fakeMgr(f), options: opts,
+    })
+    assert.equal(r1.status, 200)
+    await r1.json()
+    assert.ok(!f.state.userMessages.at(-1).payload.custom_prompt.includes('Web search note:'))
+
+    const searchTools = [{ type: 'function', function: { name: 'WebSearch', parameters: { type: 'object', properties: {} } } }]
+    const r2 = await handleChatCompletions({
+      body: { model: 'smart', tools: searchTools, tool_choice: 'none', messages: [{ role: 'user', content: 'hi' }] },
+      outpostMgr: fakeMgr(f), options: opts,
+    })
+    assert.equal(r2.status, 200)
+    await r2.json()
+    const p2 = f.state.userMessages.at(-1).payload
+    assert.equal(p2.web_search_enabled, undefined)
+    assert.ok(!p2.custom_prompt.includes('Web search note:'))
   } finally {
     await f.close()
   }
